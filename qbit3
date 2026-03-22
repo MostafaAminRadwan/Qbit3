@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+DFT-PBE v7: Gamma-Only + ADIIS + Relaxed Tolerance
+════════════════════════════════════════════════════
+Lessons from v4-v6:
+ - CDIIS causes charge sloshing → FIXED by ADIIS (v6)
+ - conv_tol=1e-6 too tight for ADIIS → FIXED: 1e-4
+ - Stage 2 density broadcast corrupts solution → REMOVED
+v7: Single Gamma + ADIIS + conv_tol=1e-4. Simple and correct.
+RUN: python3 diamond_dft_v7.py 2>&1 | tee dft_v7.log
+"""
+import numpy as np, os, sys, time, json
+os.environ['OMP_NUM_THREADS']='14'
+os.environ['MKL_NUM_THREADS']='14'
+os.environ['OPENBLAS_NUM_THREADS']='14'
+for p in['pyscf','ase','numpy','scipy','matplotlib']:
+ try:__import__(p)
+ except:print(f"Missing:{p}");sys.exit(1)
+print("OK.")
+import ase;from ase import Atoms
+import matplotlib;matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+rcParams.update({'font.family':'serif','font.size':9,'figure.dpi':150,'savefig.dpi':300,'savefig.bbox':'tight'})
+WORK=os.path.expanduser("~/diamond_dft_results");os.makedirs(WORK,exist_ok=True)
+A=3.567;BASIS='gth-dzvp';PSEUDO='gth-pbe';XC='pbe';NL=4;VAC=12.0;MAXM=50000
+try:
+ from pyscf.scf import diis as _d;_d.ADIIS;HA=True;print("  ADIIS:Y")
+except:HA=False;print("  ADIIS:N")
+def build_slab(t='bare'):
+ a=A;a1=a/np.sqrt(2);a2=a*np.sqrt(2);dz=a/4
+ lo=[(0,0),(a1/2,a2/4),(0,a2/2),(a1/2,3*a2/4)]
+ S=[];P=[]
+ for i in range(NL*2):x,y=lo[i%4];S.append('C');P.append([x,y,i*dz])
+ i1=len(S)-1;i2=len(S)-2
+ P[i1][1]-=0.15;P[i2][1]+=0.15
+ s1=list(P[i1]);s2=list(P[i2])
+ S+=['H','H'];P+=[[P[0][0],P[0][1],P[0][2]-1.09],[P[1][0],P[1][1],P[1][2]-1.09]]
+ if t=='hydrogen':S+=['H','H'];P+=[[s1[0],s1[1],s1[2]+1.09],[s2[0],s2[1],s2[2]+1.09]]
+ elif t=='oxygen':S+=['O','O'];P+=[[s1[0],s1[1],s1[2]+1.22],[s2[0],s2[1],s2[2]+1.22]]
+ elif t=='carboxylate':
+  for s in[s1,s2]:z=s[2]+1.52;S+=['C','O','O'];P+=[[s[0],s[1],z],[s[0]+.62,s[1],z+1.1],[s[0]-.62,s[1],z+1.1]]
+ elif t=='alumina':
+  for s in[s1,s2]:S+=['O','Al'];P+=[[s[0],s[1],s[2]+1.43],[s[0],s[1],s[2]+3.2]]
+ P=np.array(P);P[:,2]-=P[:,2].min()-1.5;ch=P[:,2].max()+VAC
+ cl=[[a1,0,0],[0,a2,0],[0,0,ch]]
+ sl=Atoms(symbols=S,positions=P,cell=cl,pbc=[True,True,False])
+ d=sl.get_all_distances(mic=True);np.fill_diagonal(d,999)
+ c={};
+ for x in S:c[x]=c.get(x,0)+1
+ print(f"    {len(S)} atoms {c}, min_d={d.min():.2f}")
+ return sl,[i1,i2]
+def smear(mf,sig):
+ for f in[lambda:__import__('pyscf.pbc.scf.addons',fromlist=['smearing_']).smearing_(mf,sigma=sig,method='fermi-dirac'),lambda:__import__('pyscf.scf.addons',fromlist=['smearing_']).smearing_(mf,sigma=sig,method='fermi-dirac')]:
+  try:
+   r=f()
+   if r:return r
+  except:pass
+ return mf
+def run_dft(slab,label):
+ from pyscf.pbc import gto,dft
+ al=[[a.symbol,a.position.tolist()] for a in slab]
+ c=gto.Cell();c.atom=al;c.a=slab.cell.array.tolist()
+ c.basis=BASIS;c.pseudo=PSEUDO;c.verbose=4;c.precision=1e-8;c.max_memory=MAXM;c.build()
+ nao,nel=c.nao_nr(),c.nelectron
+ print(f"\n  === {label} ===\n  AOs:{nao} el:{nel}")
+ t0=time.time()
+ k=c.make_kpts([1,1,1])
+ mf=dft.KRKS(c,k).density_fit()
+ mf.xc=XC;mf.max_memory=MAXM;mf.init_guess='atom'
+ mf.conv_tol=1e-4;mf.max_cycle=200;mf.damp=0.3;mf.level_shift=0.2;mf.diis_space=15
+ if HA:
+  from pyscf.scf import diis;mf.DIIS=diis.ADIIS;print("  DIIS:ADIIS")
+ mf=smear(mf,0.05)
+ try:mf.kernel();print(f"  E={mf.e_tot:.6f} conv={mf.converged}")
+ except Exception as e:print(f"  ERR:{e}");import traceback;traceback.print_exc();return None,c
+ print(f"  Time:{(time.time()-t0)/60:.1f}m")
+ return mf,c
+def extract_dos(mf,cell,si,sig=0.1,np2=3000):
+ H=27.2114
+ if mf is None:E=np.linspace(-25,10,np2);return E,np.zeros(np2),np.zeros(np2),0.0,{}
+ me=mf.mo_energy;mc=mf.mo_coeff
+ if not isinstance(me,(list,tuple)):me=[me];mc=[mc]
+ nk=len(me)
+ ae=np.sort(np.concatenate([np.asarray(e).real*H for e in me]))
+ nel=cell.nelectron;no=nel//2;nt=no*nk
+ if 0<nt<len(ae):EF=(ae[nt-1]+ae[min(nt,len(ae)-1)])/2
+ else:EF=ae[len(ae)//2] if len(ae)>0 else 0.0
+ gap=ae[min(nt,len(ae)-1)]-ae[nt-1]
+ print(f"    EF={EF:.3f} gap={gap:.3f}")
+ E=np.linspace(-20,10,np2);dt=np.zeros(np2);ds=np.zeros(np2)
+ al=cell.ao_labels()
+ sa=[i for i,l in enumerate(al) if int(l.split()[0]) in si]
+ if not sa:n=cell.nao_nr();sa=list(range(max(0,n-8),n))
+ print(f"    Surf AOs:{len(sa)}")
+ for ik in range(nk):
+  ek=np.asarray(me[ik]).real*H-EF;ck=np.asarray(mc[ik])
+  for j,e in enumerate(ek):
+   g=np.exp(-(E-e)**2/(2*sig**2))/(sig*np.sqrt(2*np.pi))
+   dt+=g
+   if j<ck.shape[1]:
+    c2=ck[:,j];w=sum(float(np.abs(c2[m])**2) for m in sa if m<len(c2))
+    ds+=w*g
+ dt/=nk;ds/=nk
+ mn=(E>-.5)&(E<.5);mw=(E>-2)&(E<2)
+ dte=float(np.mean(dt[mn])) if mn.sum()>0 else 0.
+ dse=float(np.mean(ds[mn])) if mn.sum()>0 else 0.
+ dsn=float(np.trapezoid(ds[mn],E[mn])) if mn.sum()>1 else 0.
+ dsw=float(np.trapezoid(ds[mw],E[mw])) if mw.sum()>1 else 0.
+ M={'dos_total_at_EF':dte,'dos_surf_at_EF':dse,'dos_surf_narrow':dsn,'dos_surf_wide':dsw,'E_F_eV':float(EF),'gap_eV':float(gap)}
+ print(f"    DOS_t@EF={dte:.4f} DOS_s@EF={dse:.4f}")
+ return E,dt,ds,EF,M
+def make_figs(R,C):
+ V=[(n,l,c) for n,l,c in C if n in R and 'error' not in R[n]]
+ if not V:print("  No figs.");return
+ nv=len(V)
+ fig,ax=plt.subplots(nv,1,figsize=(3.4,1.8*nv),sharex=True)
+ if nv==1:ax=[ax]
+ for i,(nm,lb,cl) in enumerate(V):
+  a=ax[i];r=R[nm];Eg=np.array(r['E_grid']);dt=np.array(r['dos_total'])
+  ds=np.array(r['dos_surface']);mx=max(dt.max(),1e-10)
+  a.fill_between(Eg,dt/mx,alpha=.12,color='gray');a.plot(Eg,dt/mx,'k-',lw=.4,alpha=.3,label='Total')
+  a.fill_between(Eg,ds/mx,alpha=.4,color=cl);a.plot(Eg,ds/mx,color=cl,lw=.8,label='Surface')
+  a.axvspan(-.5,.5,alpha=.08,color='red');a.axvline(0,color='k',ls='--',lw=.5,alpha=.5)
+  ap=r.get('alpha_pass',1.0);a.set_title(f"{lb} (a={ap:.2f})",fontsize=7,fontweight='bold',loc='left')
+  a.set_ylabel('DOS',fontsize=7);a.set_xlim(-12,6);a.set_ylim(bottom=0)
+  if i==0:a.legend(fontsize=5.5,loc='upper right')
+ ax[-1].set_xlabel(r'$E-E_F$ (eV)');plt.tight_layout()
+ plt.savefig(os.path.join(WORK,'fig7_dft_surface_dos.pdf'))
+ plt.savefig(os.path.join(WORK,'fig7_dft_surface_dos.png'));plt.close();print("    fig7 Y")
+ fig,(a1,a2)=plt.subplots(1,2,figsize=(7,3.2))
+ nm=[v[0] for v in V];al=[R[n].get('alpha_pass',1.0) for n in nm]
+ lb=[v[1] for v in V];cl=[v[2] for v in V]
+ b=a1.bar(range(len(nm)),al,color=cl,edgecolor='k',lw=.5,width=.6)
+ for bb,aa in zip(b,al):a1.text(bb.get_x()+bb.get_width()/2,bb.get_height()+.02,f'{aa:.2f}',ha='center',va='bottom',fontsize=7,fontweight='bold')
+ a1.set_xticks(range(len(nm)));a1.set_xticklabels(lb,fontsize=6,rotation=20,ha='right')
+ a1.set_ylabel(r'$\alpha_{\mathrm{pass}}$');a1.set_title('(a) DFT: Surface states',fontsize=9)
+ a1.axhline(1,color='k',ls=':',lw=.5,alpha=.3);a1.set_ylim(0,max(max(al)*1.3,1.2))
+ dp=np.logspace(np.log10(2),np.log10(100),50)
+ for n2,l2,c2 in[('carboxylate','MOF','#FF9800'),('alumina','Al2O3','#9C27B0'),('oxygen','O-term','#42A5F5')]:
+  if n2 not in R or 'error' in R[n2]:continue
+  ap=R[n2].get('alpha_pass',1.0);hy=(n2=='carboxylate')
+  et=[]; 
+  for d in dp:gb=500*np.exp(-d/8)+200*np.exp(-d/5)+3;gc=500*np.exp(-d/8)*ap+200*np.exp(-d/5)*(.1 if hy else .6)+3;et.append(gb/gc if gc>0 else 1.)
+  a2.semilogx(dp,et,color=c2,lw=1.2,label=l2)
+ a2.axhline(1,color='k',ls=':',lw=.5,alpha=.5);a2.axvspan(5,20,alpha=.06,color='green')
+ a2.set_xlabel('NV depth (nm)');a2.set_ylabel(r'$\eta_{\mathrm{env}}$')
+ a2.set_title(r'(b) $\eta_{\mathrm{env}}$',fontsize=9);a2.legend(fontsize=7);a2.set_xlim(2,100)
+ plt.tight_layout();plt.savefig(os.path.join(WORK,'fig8_alpha_pass_dft.pdf'))
+ plt.savefig(os.path.join(WORK,'fig8_alpha_pass_dft.png'));plt.close();print("    fig8 Y")
+def main():
+ print(f"\n{'='*60}\n  DFT v7: Gamma + ADIIS + 1e-4\n  One stage. No broadcast.\n  14 cores, {MAXM} MB\n{'='*60}")
+ C=[('bare','Bare diamond(100)','#EF5350'),('hydrogen','H-terminated','#66BB6A'),
+    ('oxygen','O-terminated','#42A5F5'),('carboxylate','Carboxylate (MOF)','#FF9800'),
+    ('alumina','Al2O3 (ALD)','#9C27B0')]
+ R={};ta=time.time()
+ for n,l,c in C:
+  print(f"\n{'#'*60}\n  {l}\n{'#'*60}")
+  t0=time.time()
+  try:sl,si=build_slab(t=n)
+  except Exception as e:print(f"  BLD:{e}");R[n]={'label':l,'color':c,'error':str(e)};continue
+  from ase.io import write;write(os.path.join(WORK,f'slab_{n}.xyz'),sl)
+  try:mf,cl=run_dft(sl,l)
+  except Exception as e:print(f"  DFT:{e}");R[n]={'label':l,'color':c,'error':str(e)};continue
+  try:Eg,dt,ds,EF,M=extract_dos(mf,cl,si)
+  except Exception as e:print(f"  DOS:{e}");Eg=np.linspace(-20,10,3000);dt=ds=np.zeros(3000);EF=0.;M={}
+  w=(time.time()-t0)/60
+  R[n]={'label':l,'color':c,'n_atoms':len(sl),'E_F_eV':float(EF),
+   'E_total_Ha':float(mf.e_tot) if mf else 0.,'converged':bool(mf.converged) if mf else False,
+   'metrics':M,'E_grid':Eg.tolist(),'dos_total':dt.tolist(),'dos_surface':ds.tolist(),'time_min':float(w)}
+  print(f"\n  Done:{w:.1f}m")
+  s={k:{kk:vv for kk,vv in v.items() if kk not in['E_grid','dos_total','dos_surface']} for k,v in R.items()}
+  with open(os.path.join(WORK,'results_intermediate.json'),'w') as f:json.dump(s,f,indent=2,default=str)
+ print(f"\n{'='*60}\n  RESULTS\n{'='*60}")
+ bm=R.get('bare',{}).get('metrics',{});br=bm.get('dos_surf_at_EF',0)
+ if br<1e-12:br=bm.get('dos_surf_narrow',0)
+ if br<1e-12:br=bm.get('dos_surf_wide',0)
+ if br<1e-12:br=1.0;print("  WARN:bare~0")
+ print(f"  Ref:{br:.6f}")
+ print(f"\n  {'Surf':<28} {'LDOS':<10} {'alpha':<8} {'C':<4} {'T'}")
+ print(f"  {'-'*58}")
+ for n,l,c in C:
+  if n not in R or 'error' in R[n]:print(f"  {l:<28} FAIL");continue
+  r=R[n];m=r.get('metrics',{});se=m.get('dos_surf_at_EF',0)
+  if se<1e-12:se=m.get('dos_surf_narrow',0)
+  if se<1e-12:se=m.get('dos_surf_wide',0)
+  a=se/br;r['alpha_pass']=float(a)
+  cv='Y' if r['converged'] else 'N'
+  print(f"  {l:<28} {se:<10.4f} {a:<8.3f} {cv:<4} {r['time_min']:.0f}m")
+ print(f"\n  Total:{(time.time()-ta)/3600:.1f}h")
+ o={}
+ for k,v in R.items():
+  o[k]={}
+  for kk,vv in v.items():
+   try:json.dumps(vv);o[k][kk]=vv
+   except:o[k][kk]=str(vv)
+ with open(os.path.join(WORK,'results_full.json'),'w') as f:json.dump(o,f,indent=2)
+ print(f"  Saved:results_full.json")
+ make_figs(R,C)
+if __name__=='__main__':
+ print(f"  Py:{sys.version.split()[0]}");import pyscf;print(f"  PySCF:{pyscf.__version__}")
+ print(f"  ASE:{ase.__version__}");print(f"  Thr:{os.environ.get('OMP_NUM_THREADS','?')}")
+ main()
